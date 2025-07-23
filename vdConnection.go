@@ -3,17 +3,24 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/danieljoos/wincred"
+	"golang.org/x/crypto/scrypt"
 )
 
 type VdConnection interface {
@@ -32,9 +39,139 @@ type NurumLab struct {
 	Cancel    context.CancelFunc `json:"-"`
 }
 
+type EncryptedConfig struct {
+	EncryptedData string `json:"encrypted_data"`
+	Salt          string `json:"salt"`
+}
+
+const (
+	CredentialTarget = "vdConnection_encryption_key"
+	AppName          = "vdConnection"
+)
+
+// Credential Manager에서 암호화 키 가져오기/저장하기
+func getOrCreateEncryptionKey() ([]byte, error) {
+	// 기존 키 확인
+	cred, err := wincred.GetGenericCredential(CredentialTarget)
+	if err == nil && len(cred.CredentialBlob) == 32 {
+		fmt.Println("✅ 기존 암호화 키를 Credential Manager에서 가져왔습니다.")
+		return cred.CredentialBlob, nil
+	}
+
+	// 새 키 생성
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("암호화 키 생성 실패: %v", err)
+	}
+
+	// Credential Manager에 저장
+	newCred := wincred.NewGenericCredential(CredentialTarget)
+	newCred.CredentialBlob = key
+	newCred.UserName = AppName
+	newCred.Comment = "vdConnection 설정 파일 암호화 키"
+
+	if err := newCred.Write(); err != nil {
+		return nil, fmt.Errorf("Credential Manager에 키 저장 실패: %v", err)
+	}
+
+	fmt.Println("🔑 새 암호화 키를 생성하여 Credential Manager에 저장했습니다.")
+	return key, nil
+}
+
+// 데이터 암호화
+func encryptData(data []byte, key []byte) (string, string, error) {
+	// Salt 생성
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", "", fmt.Errorf("salt 생성 실패: %v", err)
+	}
+
+	// Key derivation
+	derivedKey, err := scrypt.Key(key, salt, 32768, 8, 1, 32)
+	if err != nil {
+		return "", "", fmt.Errorf("키 유도 실패: %v", err)
+	}
+
+	// AES-GCM 암호화
+	block, err := aes.NewCipher(derivedKey)
+	if err != nil {
+		return "", "", fmt.Errorf("AES cipher 생성 실패: %v", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", "", fmt.Errorf("GCM 생성 실패: %v", err)
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", "", fmt.Errorf("nonce 생성 실패: %v", err)
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, data, nil)
+
+	return base64.StdEncoding.EncodeToString(ciphertext),
+		base64.StdEncoding.EncodeToString(salt), nil
+}
+
+// 데이터 복호화
+func decryptData(encryptedData string, saltStr string, key []byte) ([]byte, error) {
+	// Base64 디코딩
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedData)
+	if err != nil {
+		return nil, fmt.Errorf("암호화된 데이터 디코딩 실패: %v", err)
+	}
+
+	salt, err := base64.StdEncoding.DecodeString(saltStr)
+	if err != nil {
+		return nil, fmt.Errorf("salt 디코딩 실패: %v", err)
+	}
+
+	// Key derivation
+	derivedKey, err := scrypt.Key(key, salt, 32768, 8, 1, 32)
+	if err != nil {
+		return nil, fmt.Errorf("키 유도 실패: %v", err)
+	}
+
+	// AES-GCM 복호화
+	block, err := aes.NewCipher(derivedKey)
+	if err != nil {
+		return nil, fmt.Errorf("AES cipher 생성 실패: %v", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("GCM 생성 실패: %v", err)
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("암호화된 데이터가 너무 짧습니다")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("복호화 실패: %v", err)
+	}
+
+	return plaintext, nil
+}
+
 func Init(nurm *NurumLab) {
+	// 암호화 키 가져오기/생성
+	encKey, err := getOrCreateEncryptionKey()
+	if err != nil {
+		fmt.Printf("❌ 암호화 키 준비 실패: %v\n", err)
+		return
+	}
+
+	// 기존 암호화된 설정 파일 확인
 	file, err := os.Open("config.json")
 	if err != nil {
+		// 파일이 없으면 새로 생성
+		fmt.Println("🔧 새로운 설정을 입력해주세요:")
+
 		fmt.Printf("id : ")
 		stdin := bufio.NewReader(os.Stdin)
 		n, err := fmt.Scanln(&nurm.Id)
@@ -42,12 +179,14 @@ func Init(nurm *NurumLab) {
 			fmt.Println(n, err)
 			stdin.ReadString('\n')
 		}
+
 		fmt.Printf("password : ")
 		n, err = fmt.Scanln(&nurm.Password)
 		if err != nil {
 			fmt.Println(n, err)
 			stdin.ReadString('\n')
 		}
+
 		fmt.Printf("OTP Secret Key (OTP 앱에서 복사): ")
 		n, err = fmt.Scanln(&nurm.OtpSecret)
 		if err != nil {
@@ -55,27 +194,80 @@ func Init(nurm *NurumLab) {
 			stdin.ReadString('\n')
 		}
 
-		configFile, err := os.Create("config.json")
-		if err != nil {
-			fmt.Printf("config.json 파일 생성 실패: %v\n", err)
-			return
-		}
-		defer configFile.Close()
-
-		encoder := json.NewEncoder(configFile)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(nurm); err != nil {
-			fmt.Printf("JSON 인코딩 실패: %v\n", err)
-			return
-		}
-		fmt.Println("config.json 파일이 생성되었습니다.")
+		// 설정을 암호화하여 저장
+		saveEncryptedConfig(nurm, encKey)
 		return
 	}
 	defer file.Close()
 
-	if err := json.NewDecoder(file).Decode(nurm); err != nil {
-		fmt.Printf("JSON 디코딩 실패: %v\n", err)
+	// 암호화된 설정 파일 로드
+	var encConfig EncryptedConfig
+	if err := json.NewDecoder(file).Decode(&encConfig); err != nil {
+		fmt.Printf("❌ 암호화된 설정 파일 읽기 실패: %v\n", err)
+		// 평문 파일일 가능성 확인
+		file.Seek(0, 0)
+		if err := json.NewDecoder(file).Decode(nurm); err == nil {
+			fmt.Println("🔄 평문 설정 파일을 발견했습니다. 암호화하여 저장합니다...")
+			saveEncryptedConfig(nurm, encKey)
+			return
+		}
+		return
 	}
+
+	// 복호화
+	decryptedData, err := decryptData(encConfig.EncryptedData, encConfig.Salt, encKey)
+	if err != nil {
+		fmt.Printf("❌ 설정 복호화 실패: %v\n", err)
+		return
+	}
+
+	// JSON 디코딩
+	if err := json.Unmarshal(decryptedData, nurm); err != nil {
+		fmt.Printf("❌ 설정 JSON 디코딩 실패: %v\n", err)
+		return
+	}
+
+	fmt.Println("✅ 암호화된 설정을 성공적으로 로드했습니다.")
+}
+
+// 암호화된 설정 저장
+func saveEncryptedConfig(nurm *NurumLab, encKey []byte) {
+	// JSON 인코딩
+	jsonData, err := json.Marshal(nurm)
+	if err != nil {
+		fmt.Printf("❌ JSON 인코딩 실패: %v\n", err)
+		return
+	}
+
+	// 데이터 암호화
+	encryptedData, salt, err := encryptData(jsonData, encKey)
+	if err != nil {
+		fmt.Printf("❌ 데이터 암호화 실패: %v\n", err)
+		return
+	}
+
+	// 암호화된 설정 구조체 생성
+	encConfig := EncryptedConfig{
+		EncryptedData: encryptedData,
+		Salt:          salt,
+	}
+
+	// 파일에 저장
+	configFile, err := os.Create("config.json")
+	if err != nil {
+		fmt.Printf("❌ config.json 파일 생성 실패: %v\n", err)
+		return
+	}
+	defer configFile.Close()
+
+	encoder := json.NewEncoder(configFile)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(encConfig); err != nil {
+		fmt.Printf("❌ 암호화된 설정 저장 실패: %v\n", err)
+		return
+	}
+
+	fmt.Println("🔒 설정이 암호화되어 저장되었습니다.")
 }
 
 func (nurm *NurumLab) InitConfig() {
@@ -95,7 +287,7 @@ func (nurm *NurumLab) GenerateOTP() (string, error) {
 			"-", ""),
 		"_", ""))
 
-	fmt.Printf("🔍 처리된 OTP Secret: %s (길이: %d)\n", secret, len(secret))
+	//fmt.Printf("🔍 처리된 OTP Secret: %s (길이: %d)\n", secret, len(secret))
 
 	// Base32 패딩 추가 (필요한 경우)
 	switch len(secret) % 8 {
@@ -278,6 +470,10 @@ func (nurm *NurumLab) TwoFactorAuth() {
 			// OTP 입력 필드 선택자
 			otpSelector := `input[id="otpNumber"]`
 
+			if err := chromedp.WaitVisible(otpSelector, chromedp.ByQuery).Do(ctx); err != nil {
+				return err
+			}
+
 			// OTP 코드 입력
 			if err := chromedp.SendKeys(otpSelector, otpCode, chromedp.ByQuery).Do(ctx); err != nil {
 				return err
@@ -293,7 +489,7 @@ func (nurm *NurumLab) TwoFactorAuth() {
 			}
 
 			fmt.Printf("✅ OTP 인증 완료\n")
-			time.Sleep(3 * time.Second) // 인증 처리 대기
+			time.Sleep(1 * time.Second) // 인증 처리 대기
 			return nil
 		}),
 	)
